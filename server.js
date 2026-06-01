@@ -1,11 +1,7 @@
-// ============================================================
-// Russian Voice AI Customer Support Bot
-// Stack: Node.js + Express + Groq (FREE) + ElevenLabs (FREE)
-// Built by SAZ Tech — saztech.online
-// ============================================================
-
 const express = require('express');
 const cors = require('cors');
+const https = require('https');
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -13,11 +9,8 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 3001;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-
-// ── ElevenLabs Russian voice ID ──
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'N2lVS1w4EtoT3dr4eOWO';
 
-// ── In-memory user store ──
 const users = new Map();
 
 function getUser(userId) {
@@ -25,10 +18,9 @@ function getUser(userId) {
     users.set(userId, {
       id: userId,
       name: null,
-      preferences: {},
       history: [],
-      createdAt: new Date().toISOString(),
       messageCount: 0,
+      createdAt: new Date().toISOString(),
     });
   }
   return users.get(userId);
@@ -36,24 +28,13 @@ function getUser(userId) {
 
 function buildSystemPrompt(user) {
   const userName = user.name ? `Имя пользователя: ${user.name}.` : '';
-  return `Ты — профессиональный AI-ассистент службы поддержки клиентов.
-Ты всегда отвечаешь на русском языке, вежливо и профессионально.
-
+  return `Ты профессиональный AI-ассистент службы поддержки клиентов.
+Всегда отвечай на русском языке, вежливо и профессионально.
 ${userName}
-Количество предыдущих обращений: ${user.messageCount}
-
-Твои задачи:
-- Помогать клиентам решать их вопросы и проблемы
-- Запоминать имя пользователя если он его назвал
-- Давать чёткие, полезные и дружелюбные ответы
-- Если не знаешь ответа — честно сказать и предложить связаться с живым специалистом
-
-Правила:
-- Всегда отвечай на русском языке
-- Будь вежливым и профессиональным
-- Давай короткие чёткие ответы (2-4 предложения для голосового ответа)
-- Если пользователь называет своё имя — запомни и используй его
-- Не придумывай информацию которой у тебя нет`;
+- Помогай клиентам решать вопросы
+- Запоминай имя если пользователь его назвал
+- Давай короткие чёткие ответы 2-4 предложения
+- Никогда не придумывай информацию`;
 }
 
 function extractName(message) {
@@ -69,152 +50,173 @@ function extractName(message) {
   return null;
 }
 
-// ────────────────────────────────────────────────
-// ROUTE: Chat — uses Groq (FREE)
-// ────────────────────────────────────────────────
+function httpsPost(hostname, path, headers, body) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = typeof body === 'string' ? body : JSON.stringify(body);
+    const options = {
+      hostname,
+      path,
+      method: 'POST',
+      headers: {
+        ...headers,
+        'Content-Length': Buffer.byteLength(bodyStr),
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve({ ok: res.statusCode < 300, status: res.statusCode, data: JSON.parse(data) });
+        } catch (e) {
+          resolve({ ok: false, status: res.statusCode, data: {} });
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
+function httpsPostBinary(hostname, path, headers, body) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname,
+      path,
+      method: 'POST',
+      headers: {
+        ...headers,
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        resolve({ ok: res.statusCode === 200, buffer: Buffer.concat(chunks) });
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 app.post('/api/chat', async (req, res) => {
   const { userId, message } = req.body;
-
   if (!userId || !message) {
-    return res.status(400).json({ error: 'userId and message are required' });
+    return res.status(400).json({ error: 'userId and message required' });
   }
-
   if (!GROQ_API_KEY) {
-    return res.status(500).json({ error: 'GROQ_API_KEY not set. Get free key at https://groq.com' });
+    return res.status(500).json({ error: 'GROQ_API_KEY not set' });
   }
 
   try {
     const user = getUser(userId);
+    const name = extractName(message);
+    if (name) user.name = name;
 
-    // Extract name if mentioned
-    const detectedName = extractName(message);
-    if (detectedName) user.name = detectedName;
-
-    // Add to history
     user.history.push({ role: 'user', content: message });
     user.messageCount++;
 
-    // Keep last 20 messages
-    const recentHistory = user.history.slice(-20);
+    const messages = [
+      { role: 'system', content: buildSystemPrompt(user) },
+      ...user.history.slice(-20),
+    ];
 
-    // ── Call Groq API (FREE — Llama 3.3 70B) ──
-    const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
+    const groqRes = await httpsPost(
+      'api.groq.com',
+      '/openai/v1/chat/completions',
+      {
         'Authorization': `Bearer ${GROQ_API_KEY}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          { role: 'system', content: buildSystemPrompt(user) },
-          ...recentHistory,
-        ],
-        max_tokens: 300,
-        temperature: 0.7,
-      }),
-    });
+      { model: 'llama-3.3-70b-versatile', messages, max_tokens: 300, temperature: 0.7 }
+    );
 
-    const groqData = await groqResponse.json();
-
-    if (!groqResponse.ok) {
-      console.error('Groq error:', groqData);
-      return res.status(500).json({ error: 'Groq API error', details: groqData });
+    if (!groqRes.ok || !groqRes.data.choices) {
+      return res.status(500).json({ error: 'Groq error', details: groqRes.data });
     }
 
-    const aiText = groqData.choices[0].message.content;
-
-    // Add AI response to history
+    const aiText = groqRes.data.choices[0].message.content;
     user.history.push({ role: 'assistant', content: aiText });
 
-    // ── Convert to Russian speech with ElevenLabs (FREE TIER) ──
     let audioBase64 = null;
-
     if (ELEVENLABS_API_KEY) {
-      const elevenRes = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
-        {
-          method: 'POST',
-          headers: {
+      try {
+        const audioRes = await httpsPostBinary(
+          'api.elevenlabs.io',
+          `/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+          {
             'xi-api-key': ELEVENLABS_API_KEY,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
+          Buffer.from(JSON.stringify({
             text: aiText,
             model_id: 'eleven_multilingual_v2',
-            voice_settings: {
-              stability: 0.5,
-              similarity_boost: 0.75,
-              style: 0.3,
-              use_speaker_boost: true,
-            },
-          }),
+            voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+          }))
+        );
+        if (audioRes.ok) {
+          audioBase64 = audioRes.buffer.toString('base64');
         }
-      );
-
-      if (elevenRes.ok) {
-        const audioBuffer = await elevenRes.arrayBuffer();
-        audioBase64 = Buffer.from(audioBuffer).toString('base64');
-      } else {
-        const err = await elevenRes.json().catch(() => ({}));
-        console.error('ElevenLabs error:', err);
+      } catch (e) {
+        console.error('ElevenLabs error:', e.message);
       }
     }
 
     return res.json({
       text: aiText,
       audio: audioBase64,
-      user: {
-        id: userId,
-        name: user.name,
-        messageCount: user.messageCount,
-      },
+      user: { id: userId, name: user.name, messageCount: user.messageCount },
     });
 
   } catch (err) {
-    console.error('Server error:', err);
+    console.error('Chat error:', err);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ────────────────────────────────────────────────
-// ROUTE: Speech to text — uses Groq Whisper (FREE)
-// ────────────────────────────────────────────────
 app.post('/api/transcribe', async (req, res) => {
   const { audioBase64 } = req.body;
-
-  if (!audioBase64) {
-    return res.status(400).json({ error: 'audioBase64 is required' });
-  }
-
-  if (!GROQ_API_KEY) {
-    return res.status(500).json({ error: 'GROQ_API_KEY not set' });
-  }
+  if (!audioBase64) return res.status(400).json({ error: 'audioBase64 required' });
 
   try {
     const audioBuffer = Buffer.from(audioBase64, 'base64');
+    const boundary = 'FormBoundary' + Math.random().toString(36).substr(2);
 
-    const formData = new FormData();
-    const blob = new Blob([audioBuffer], { type: 'audio/webm' });
-    formData.append('file', blob, 'audio.webm');
-    formData.append('model', 'whisper-large-v3');
-    formData.append('language', 'ru');
-    formData.append('response_format', 'json');
+    const formData = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.webm"\r\nContent-Type: audio/webm\r\n\r\n`),
+      audioBuffer,
+      Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3\r\n--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nru\r\n--${boundary}--\r\n`),
+    ]);
 
-    // ── Groq Whisper (FREE) ──
-    const whisperRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
-      body: formData,
+    const result = await new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'api.groq.com',
+        path: '/openai/v1/audio/transcriptions',
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': formData.length,
+        },
+      };
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          try { resolve(JSON.parse(data)); }
+          catch (e) { reject(new Error('Invalid JSON')); }
+        });
+      });
+      req.on('error', reject);
+      req.write(formData);
+      req.end();
     });
 
-    const whisperData = await whisperRes.json();
-
-    if (!whisperRes.ok) {
-      return res.status(500).json({ error: 'Whisper error', details: whisperData });
-    }
-
-    return res.json({ text: whisperData.text });
+    return res.json({ text: result.text || '' });
 
   } catch (err) {
     console.error('Transcribe error:', err);
@@ -222,39 +224,23 @@ app.post('/api/transcribe', async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────
-// ROUTE: Get user profile
-// ────────────────────────────────────────────────
 app.get('/api/user/:userId', (req, res) => {
   const user = getUser(req.params.userId);
-  res.json({
-    id: user.id,
-    name: user.name,
-    messageCount: user.messageCount,
-    createdAt: user.createdAt,
-  });
+  res.json({ id: user.id, name: user.name, messageCount: user.messageCount });
 });
 
-// ────────────────────────────────────────────────
-// ROUTE: Clear user history
-// ────────────────────────────────────────────────
 app.delete('/api/user/:userId/history', (req, res) => {
   const user = getUser(req.params.userId);
   user.history = [];
   res.json({ success: true });
 });
 
-// ────────────────────────────────────────────────
-// ROUTE: Health check
-// ────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    users: users.size,
     groq: !!GROQ_API_KEY,
     elevenlabs: !!ELEVENLABS_API_KEY,
-    model: 'llama-3.3-70b-versatile (FREE)',
-    speech: 'whisper-large-v3 via Groq (FREE)',
+    model: 'llama-3.3-70b-versatile FREE',
   });
 });
 
@@ -263,8 +249,7 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`\n✅ Russian Voice Bot running on port ${PORT}`);
-  console.log(`   Groq AI:     ${GROQ_API_KEY ? '✅ Connected (FREE)' : '❌ Missing — get free key at groq.com'}`);
-  console.log(`   ElevenLabs:  ${ELEVENLABS_API_KEY ? '✅ Connected (FREE tier)' : '❌ Missing — get free key at elevenlabs.io'}`);
-  console.log(`   Health:      http://localhost:${PORT}/health\n`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Groq: ${GROQ_API_KEY ? 'Connected FREE' : 'Missing key'}`);
+  console.log(`ElevenLabs: ${ELEVENLABS_API_KEY ? 'Connected FREE' : 'Missing key'}`);
 });
